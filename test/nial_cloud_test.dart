@@ -117,6 +117,7 @@ void main() {
     store: store,
     apiKey: 'key',
     projectId: 'demo',
+    keyPrefix: 'nial_',
     debounce: Duration.zero,
   );
 
