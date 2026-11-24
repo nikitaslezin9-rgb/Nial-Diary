@@ -3,11 +3,12 @@
 // безопасности Firestore, а не этот ключ.
 //
 // Личная сборка (по умолчанию) — проект «Nial Diary» (nial-diary-43dfa).
-// Публичная сборка для других пользователей собирается с флагами:
+// Публичная сборка для других пользователей — отдельный проект
+// «Nial Diary Public» (nial-diary-public) и собирается с флагом:
 //   --dart-define=NIAL_EDITION=public
-//   --dart-define=NIAL_PUBLIC_API_KEY=<ключ публичного проекта>
-//   --dart-define=NIAL_PUBLIC_PROJECT_ID=<ID публичного проекта>
-// Публичная сборка никогда не использует личный проект.
+// Публичная сборка никогда не использует личный проект. В публичном
+// проекте нет читательских аккаунтов: вход только анонимный, правила —
+// в файле firestore.public.rules.
 
 const nialEdition = String.fromEnvironment(
   'NIAL_EDITION',
@@ -17,8 +18,14 @@ const nialIsPublicEdition = nialEdition == 'public';
 
 const _personalApiKey = 'AIzaSyCH59yPHh2TBzeyoZX89hRIa2RWA8--9sA';
 const _personalProjectId = 'nial-diary-43dfa';
-const _publicApiKey = String.fromEnvironment('NIAL_PUBLIC_API_KEY');
-const _publicProjectId = String.fromEnvironment('NIAL_PUBLIC_PROJECT_ID');
+const _publicApiKey = String.fromEnvironment(
+  'NIAL_PUBLIC_API_KEY',
+  defaultValue: 'AIzaSyCAtfGh6ycYa089RH6_v85dfxwjpMGVGdQ',
+);
+const _publicProjectId = String.fromEnvironment(
+  'NIAL_PUBLIC_PROJECT_ID',
+  defaultValue: 'nial-diary-public',
+);
 
 const nialCloudApiKey = nialIsPublicEdition ? _publicApiKey : _personalApiKey;
 const nialCloudProjectId = nialIsPublicEdition
