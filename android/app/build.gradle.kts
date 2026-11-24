@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -10,7 +12,7 @@ plugins {
 // и не видит её записи и настройки облака.
 val nialPublicEdition = (project.findProperty("dart-defines") as String?)
     ?.split(",")
-    ?.mapNotNull { runCatching { String(java.util.Base64.getDecoder().decode(it)) }.getOrNull() }
+    ?.mapNotNull { runCatching { Base64.getDecoder().decode(it).decodeToString() }.getOrNull() }
     ?.contains("NIAL_EDITION=public") == true
 
 android {
