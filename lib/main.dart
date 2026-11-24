@@ -16,6 +16,8 @@ import 'package:material_ui/material_ui.dart';
 import 'services/ai_config.dart';
 import 'services/diary_storage.dart';
 import 'services/nial_cloud.dart';
+import 'services/nial_account_panel.dart';
+import 'services/nial_cloud_config.dart';
 import 'services/nial_cloud_panel.dart';
 import 'services/nial_media.dart';
 import 'services/nial_profile.dart';
@@ -1072,7 +1074,60 @@ class _HomeState extends State<Home> {
   final _diaryStorage = DiaryStorage();
   Future<void> _saveQueue = Future<void>.value();
 
-  final _cloud = NialCloudSync();
+  final _cloud = NialCloudSync(
+    profileSnapshot: nialIsPublicEdition ? _cloudProfile : null,
+  );
+
+  static Future<NialCloudProfile?> _cloudProfile() async {
+    final profile = await NialProfileStore.read();
+    return (name: profile.name, about: profile.about);
+  }
+
+  /// После входа по почте: добавляет в дневник записи из облака, которых
+  /// нет на телефоне, и подставляет имя профиля, если оно ещё не задано.
+  Future<int> _applyCloudRestore(NialCloudRestore restore) async {
+    final known = {for (final entry in entries) entry.id};
+    final added = [
+      for (final item in restore.entries)
+        if (!known.contains(item.id))
+          Entry(
+            item.title,
+            item.text,
+            item.date,
+            favorite: item.favorite,
+            id: item.id,
+          ),
+    ];
+    var profileChanged = false;
+    final name = restore.name;
+    if (name != null && name.isNotEmpty) {
+      try {
+        final local = await NialProfileStore.read();
+        if (local.name.isEmpty) {
+          await NialProfileStore.save(
+            NialProfile(
+              name: name,
+              about: local.about.isEmpty ? restore.about ?? '' : local.about,
+              avatar: local.avatar,
+            ),
+          );
+          profileChanged = true;
+        }
+      } catch (_) {
+        // Профиль на телефоне остаётся прежним.
+      }
+    }
+    if (!mounted) return added.length;
+    setState(() {
+      // Существующий порядок записей не меняем: недостающие добавляются
+      // в конец, от новых к старым.
+      added.sort((a, b) => b.date.compareTo(a.date));
+      entries.addAll(added);
+      if (profileChanged) _profileRevision++;
+    });
+    await _saveDiary();
+    return added.length;
+  }
 
   List<NialCloudEntry> _cloudEntries() => [
     for (final entry in entries)
@@ -2083,6 +2138,18 @@ class _HomeState extends State<Home> {
       const SizedBox(height: 12),
       box(NialProfileCard(key: ValueKey(_profileRevision))),
       const SizedBox(height: 10),
+      if (nialIsPublicEdition) ...[
+        _compactSettingsGroup(
+          'Аккаунт',
+          Icons.account_circle_outlined,
+          NialAccountPanel(
+            cloud: _cloud,
+            locked: _backupBusy || !_storageReady,
+            onRestored: _applyCloudRestore,
+          ),
+        ),
+        const SizedBox(height: 10),
+      ],
       _compactSettingsGroup(
         'Оформление',
         Icons.palette_outlined,

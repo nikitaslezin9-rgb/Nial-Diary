@@ -1,7 +1,7 @@
 rules_version = '2';
 
 // Правила для ПУБЛИЧНОГО Firebase-проекта Nial Diary.
-// Каждый пользователь (анонимный вход) читает и меняет только свои данные.
+// Каждый пользователь (анонимный вход или почта) читает и меняет только свои данные.
 // Никаких читательских аккаунтов, общего доступа и чтения чужих записей.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -12,7 +12,14 @@ service cloud.firestore {
     match /users/{uid} {
       allow read, delete: if isOwner(uid);
       allow create, update: if isOwner(uid)
-        && request.resource.data.keys().hasOnly(['app', 'entryCount', 'updatedAt']);
+        && request.resource.data.keys().hasOnly(
+             ['app', 'entryCount', 'updatedAt', 'name', 'about'])
+        && (!('name' in request.resource.data)
+            || (request.resource.data.name is string
+                && request.resource.data.name.size() <= 60))
+        && (!('about' in request.resource.data)
+            || (request.resource.data.about is string
+                && request.resource.data.about.size() <= 160));
 
       match /entries/{entryId} {
         allow read, delete: if isOwner(uid);

@@ -99,12 +99,18 @@ class NialCloudStatus {
     this.busy = false,
     this.lastSyncAt,
     this.error,
+    this.email,
+    this.emailVerified = false,
   });
   final bool loaded;
   final bool enabled;
   final bool busy;
   final DateTime? lastSyncAt;
   final String? error;
+
+  /// Почта аккаунта, к которому привязана облачная копия (null — без аккаунта).
+  final String? email;
+  final bool emailVerified;
 
   NialCloudStatus copyWith({
     bool? loaded,
@@ -114,14 +120,31 @@ class NialCloudStatus {
     bool clearLastSync = false,
     String? error,
     bool clearError = false,
+    String? email,
+    bool clearEmail = false,
+    bool? emailVerified,
   }) => NialCloudStatus(
     loaded: loaded ?? this.loaded,
     enabled: enabled ?? this.enabled,
     busy: busy ?? this.busy,
     lastSyncAt: clearLastSync ? null : lastSyncAt ?? this.lastSyncAt,
     error: clearError ? null : error ?? this.error,
+    email: clearEmail ? null : email ?? this.email,
+    emailVerified: clearEmail ? false : emailVerified ?? this.emailVerified,
   );
 }
+
+/// Что лежит в облаке аккаунта: записи и имя профиля. Используется при входе
+/// на новом телефоне, чтобы вернуть тексты записей в дневник.
+class NialCloudRestore {
+  const NialCloudRestore({this.entries = const [], this.name, this.about});
+  final List<NialCloudEntry> entries;
+  final String? name;
+  final String? about;
+}
+
+/// Имя и описание профиля, которые хранятся вместе с облачной копией.
+typedef NialCloudProfile = ({String name, String about});
 
 /// Простое хранилище настроек облачной копии (в приложении — SharedPreferences).
 abstract class NialCloudStore {
@@ -149,6 +172,7 @@ class NialCloudSync {
     this.apiKey = nialCloudApiKey,
     this.projectId = nialCloudProjectId,
     this.keyPrefix = nialCloudKeyPrefix,
+    this.profileSnapshot,
     this.debounce = const Duration(seconds: 4),
   }) : _client = client ?? http.Client(),
        _store = store ?? _PreferencesCloudStore();
@@ -160,6 +184,9 @@ class NialCloudSync {
 
   /// Приставка ключей настроек. Личная сборка: 'nial_' (прежние ключи).
   final String keyPrefix;
+
+  /// Профиль, который отправляется вместе с копией (только в публичной сборке).
+  final Future<NialCloudProfile?> Function()? profileSnapshot;
   final Duration debounce;
 
   /// Облако настроено для этой сборки (есть ключ и ID проекта).
@@ -170,6 +197,9 @@ class NialCloudSync {
   String get _uidKey => '${keyPrefix}cloud_uid_v1';
   String get _syncedKey => '${keyPrefix}cloud_synced_v1';
   String get _lastSyncKey => '${keyPrefix}cloud_last_sync_v1';
+  String get _emailKey => '${keyPrefix}cloud_email_v1';
+  String get _verifiedKey => '${keyPrefix}cloud_email_verified_v1';
+  String get _profileSentKey => '${keyPrefix}cloud_profile_sent_v1';
   static const _timeout = Duration(seconds: 25);
   static const _maxWrites = 200;
   static const _maxBatchBytes = 4 * 1024 * 1024;
@@ -185,8 +215,7 @@ class NialCloudSync {
 
   static bool isValidId(String id) => _validId.hasMatch(id);
 
-  String get _documents =>
-      'projects/$projectId/databases/(default)/documents';
+  String get _documents => 'projects/$projectId/databases/(default)/documents';
 
   void _setStatus(NialCloudStatus value) {
     if (!_disposed) status.value = value;
@@ -206,12 +235,16 @@ class NialCloudSync {
     try {
       final enabled = configured && await _store.read(_enabledKey) == '1';
       final last = DateTime.tryParse(await _store.read(_lastSyncKey) ?? '');
+      final email = await _store.read(_emailKey);
       _setStatus(
         status.value.copyWith(
           loaded: true,
           enabled: enabled,
           lastSyncAt: last,
           clearLastSync: last == null,
+          email: email,
+          clearEmail: email == null,
+          emailVerified: await _store.read(_verifiedKey) == '1',
         ),
       );
     } catch (_) {
@@ -244,30 +277,27 @@ class NialCloudSync {
 
   /// Отправляет в облако новые и изменённые записи и удаляет из облака те,
   /// которых больше нет в дневнике.
-  Future<NialCloudReport> sync(List<NialCloudEntry> entries) =>
-      _serial(() async {
-        if (!status.value.enabled || !configured) {
-          return const NialCloudReport();
-        }
-        _setStatus(status.value.copyWith(busy: true));
-        try {
-          final report = await _sync(entries);
-          final now = DateTime.now();
-          await _store.write(_lastSyncKey, now.toUtc().toIso8601String());
-          _setStatus(
-            status.value.copyWith(
-              busy: false,
-              lastSyncAt: now,
-              clearError: true,
-            ),
-          );
-          return report;
-        } catch (error) {
-          final failure = _describe(error);
-          _setStatus(status.value.copyWith(busy: false, error: failure.message));
-          throw failure;
-        }
-      });
+  Future<NialCloudReport> sync(List<NialCloudEntry> entries) => _serial(
+    () async {
+      if (!status.value.enabled || !configured) {
+        return const NialCloudReport();
+      }
+      _setStatus(status.value.copyWith(busy: true));
+      try {
+        final report = await _sync(entries);
+        final now = DateTime.now();
+        await _store.write(_lastSyncKey, now.toUtc().toIso8601String());
+        _setStatus(
+          status.value.copyWith(busy: false, lastSyncAt: now, clearError: true),
+        );
+        return report;
+      } catch (error) {
+        final failure = _describe(error);
+        _setStatus(status.value.copyWith(busy: false, error: failure.message));
+        throw failure;
+      }
+    },
+  );
 
   /// Удаляет облачную копию и анонимный облачный профиль, выключает отправку.
   Future<void> deleteCloudCopy() => _serial(() async {
@@ -275,34 +305,77 @@ class NialCloudSync {
     _setStatus(status.value.copyWith(busy: true));
     try {
       if (await _store.read(_refreshKey) != null) {
-        final token = await _token();
         final uid = await _store.read(_uidKey);
         if (uid != null) {
-          final names = await _listRemote(uid, token);
-          final writes = <Map<String, dynamic>>[
-            for (final name in names) {'delete': name},
-            {'delete': '$_documents/users/$uid'},
-          ];
-          for (var i = 0; i < writes.length; i += _maxWrites) {
-            final end = i + _maxWrites > writes.length
-                ? writes.length
-                : i + _maxWrites;
-            await _commit(writes.sublist(i, end));
-          }
+          await _deleteRemote(uid, deleteAccount: true);
+        } else {
+          await _post(
+            _identity('accounts:delete'),
+            jsonEncode({'idToken': await _token()}),
+            json: true,
+          );
         }
-        await _post(
-          Uri.https('identitytoolkit.googleapis.com', '/v1/accounts:delete', {
-            'key': apiKey,
-          }),
-          jsonEncode({'idToken': await _token()}),
-          json: true,
-        );
       }
       await _clearSession();
-      await _store.write(_enabledKey, null);
-      await _store.write(_lastSyncKey, null);
+      await _clearAccount();
+      _setStatus(const NialCloudStatus(loaded: true, enabled: false));
+    } catch (error) {
+      final failure = _describe(error);
+      _setStatus(status.value.copyWith(busy: false, error: failure.message));
+      throw failure;
+    }
+  });
+
+  /// Регистрация по почте: текущий облачный профиль (и уже отправленные
+  /// записи) привязывается к почте, идентификатор пользователя не меняется.
+  /// Включает облачную копию.
+  Future<void> register(String email, String password) => _serial(() async {
+    _requireConfigured();
+    _setStatus(status.value.copyWith(busy: true, clearError: true));
+    try {
+      final token = await _token();
+      final response = await _post(
+        _identity('accounts:signUp'),
+        jsonEncode({
+          'idToken': token,
+          'email': email.trim(),
+          'password': password,
+          'returnSecureToken': true,
+        }),
+        json: true,
+      );
+      if (response.statusCode != 200) throw _authFailure(response);
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final idToken = data['idToken'];
+      final refreshToken = data['refreshToken'];
+      final uid = data['localId'];
+      if (idToken is! String || refreshToken is! String || uid is! String) {
+        throw const NialCloudException('Облако вернуло некорректный ответ.');
+      }
+      if (uid != await _store.read(_uidKey)) {
+        await _store.write(_syncedKey, null);
+      }
+      await _saveSession(
+        idToken: idToken,
+        refreshToken: refreshToken,
+        uid: uid,
+        expiresIn: data['expiresIn'],
+      );
+      await _store.write(_emailKey, email.trim());
+      await _store.write(_verifiedKey, null);
+      await _store.write(_enabledKey, '1');
+      try {
+        await _sendVerification(idToken);
+      } catch (_) {
+        // Письмо можно отправить повторно из настроек.
+      }
       _setStatus(
-        const NialCloudStatus(loaded: true, enabled: false),
+        status.value.copyWith(
+          busy: false,
+          enabled: true,
+          email: email.trim(),
+          emailVerified: false,
+        ),
       );
     } catch (error) {
       final failure = _describe(error);
@@ -310,6 +383,271 @@ class NialCloudSync {
       throw failure;
     }
   });
+
+  /// Вход по почте. Возвращает тексты записей и профиль из облака, чтобы
+  /// приложение добавило в дневник недостающие записи. Если до входа на
+  /// телефоне была анонимная копия без почты, она удаляется из облака:
+  /// записи телефона затем отправятся в аккаунт.
+  Future<NialCloudRestore> signIn(String email, String password) => _serial(
+    () async {
+      _requireConfigured();
+      _timer?.cancel();
+      _setStatus(status.value.copyWith(busy: true, clearError: true));
+      try {
+        final response = await _post(
+          _identity('accounts:signInWithPassword'),
+          jsonEncode({
+            'email': email.trim(),
+            'password': password,
+            'returnSecureToken': true,
+          }),
+          json: true,
+        );
+        if (response.statusCode != 200) throw _authFailure(response);
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final idToken = data['idToken'];
+        final refreshToken = data['refreshToken'];
+        final uid = data['localId'];
+        if (idToken is! String || refreshToken is! String || uid is! String) {
+          throw const NialCloudException('Облако вернуло некорректный ответ.');
+        }
+        final oldUid = await _store.read(_uidKey);
+        if (oldUid != null &&
+            oldUid != uid &&
+            await _store.read(_emailKey) == null &&
+            await _store.read(_refreshKey) != null) {
+          try {
+            await _deleteRemote(oldUid, deleteAccount: true);
+          } catch (_) {
+            // Не мешаем входу, если старую копию удалить не удалось.
+          }
+        }
+        await _clearSession();
+        await _saveSession(
+          idToken: idToken,
+          refreshToken: refreshToken,
+          uid: uid,
+          expiresIn: data['expiresIn'],
+        );
+        final verified = await _lookupVerified(idToken);
+        await _store.write(_emailKey, email.trim());
+        await _store.write(_verifiedKey, verified ? '1' : null);
+        await _store.write(_enabledKey, '1');
+        final restore = await _download(uid, idToken);
+        _setStatus(
+          status.value.copyWith(
+            busy: false,
+            enabled: true,
+            email: email.trim(),
+            emailVerified: verified,
+          ),
+        );
+        return restore;
+      } catch (error) {
+        final failure = _describe(error);
+        _setStatus(status.value.copyWith(busy: false, error: failure.message));
+        throw failure;
+      }
+    },
+  );
+
+  /// Выход из аккаунта: записи на телефоне остаются, копия в облаке тоже,
+  /// отправка выключается.
+  Future<void> signOut() => _serial(() async {
+    _timer?.cancel();
+    await _clearSession();
+    await _clearAccount();
+    _setStatus(const NialCloudStatus(loaded: true, enabled: false));
+  });
+
+  /// Повторно отправляет письмо для подтверждения почты.
+  Future<void> resendVerification() => _serial(() async {
+    try {
+      await _sendVerification(await _token());
+    } catch (error) {
+      throw _describe(error);
+    }
+  });
+
+  /// Проверяет, подтверждена ли почта (после перехода по ссылке из письма).
+  Future<bool> refreshVerification() => _serial(() async {
+    try {
+      final verified = await _lookupVerified(await _token(force: true));
+      await _store.write(_verifiedKey, verified ? '1' : null);
+      _setStatus(status.value.copyWith(emailVerified: verified));
+      return verified;
+    } catch (error) {
+      throw _describe(error);
+    }
+  });
+
+  /// Письмо со ссылкой для смены пароля.
+  Future<void> sendPasswordReset(String email) => _serial(() async {
+    _requireConfigured();
+    try {
+      final response = await _post(
+        _identity('accounts:sendOobCode'),
+        jsonEncode({'requestType': 'PASSWORD_RESET', 'email': email.trim()}),
+        json: true,
+      );
+      if (response.statusCode != 200) throw _authFailure(response);
+    } catch (error) {
+      throw _describe(error);
+    }
+  });
+
+  void _requireConfigured() {
+    if (!configured) {
+      throw const NialCloudException(
+        'Облако не настроено в этой сборке приложения.',
+      );
+    }
+  }
+
+  Uri _identity(String method) => Uri.https(
+    'identitytoolkit.googleapis.com',
+    '/v1/$method',
+    {'key': apiKey},
+  );
+
+  Future<void> _sendVerification(String idToken) async {
+    final response = await _post(
+      _identity('accounts:sendOobCode'),
+      jsonEncode({'requestType': 'VERIFY_EMAIL', 'idToken': idToken}),
+      json: true,
+    );
+    if (response.statusCode != 200) throw _authFailure(response);
+  }
+
+  Future<bool> _lookupVerified(String idToken) async {
+    final response = await _post(
+      _identity('accounts:lookup'),
+      jsonEncode({'idToken': idToken}),
+      json: true,
+    );
+    if (response.statusCode != 200) throw _authFailure(response);
+    final users = (jsonDecode(response.body) as Map)['users'];
+    if (users is List && users.isNotEmpty && users.first is Map) {
+      return (users.first as Map)['emailVerified'] == true;
+    }
+    return false;
+  }
+
+  Future<void> _deleteRemote(String uid, {required bool deleteAccount}) async {
+    final token = await _token();
+    final names = await _listRemote(uid, token);
+    final writes = <Map<String, dynamic>>[
+      for (final name in names) {'delete': name},
+      {'delete': '$_documents/users/$uid'},
+    ];
+    for (var i = 0; i < writes.length; i += _maxWrites) {
+      final end = i + _maxWrites > writes.length
+          ? writes.length
+          : i + _maxWrites;
+      await _commit(writes.sublist(i, end));
+    }
+    if (deleteAccount) {
+      await _post(
+        _identity('accounts:delete'),
+        jsonEncode({'idToken': token}),
+        json: true,
+      );
+    }
+  }
+
+  Future<NialCloudRestore> _download(String uid, String token) async {
+    final result = <NialCloudEntry>[];
+    String? pageToken;
+    do {
+      final response = await _client
+          .get(
+            Uri.https(
+              'firestore.googleapis.com',
+              '/v1/$_documents/users/$uid/entries',
+              {'pageSize': '300', 'pageToken': ?pageToken},
+            ),
+            headers: {'Authorization': 'Bearer $token'},
+          )
+          .timeout(_timeout);
+      if (response.statusCode != 200) throw _httpFailure(response);
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      for (final document in data['documents'] as List? ?? const []) {
+        final entry = _parseEntry(document);
+        if (entry != null) result.add(entry);
+      }
+      pageToken = data['nextPageToken'] as String?;
+    } while (pageToken != null && pageToken.isNotEmpty);
+
+    String? name;
+    String? about;
+    final meta = await _client
+        .get(
+          Uri.https('firestore.googleapis.com', '/v1/$_documents/users/$uid'),
+          headers: {'Authorization': 'Bearer $token'},
+        )
+        .timeout(_timeout);
+    if (meta.statusCode == 200) {
+      final fields = (jsonDecode(meta.body) as Map)['fields'];
+      if (fields is Map) {
+        name = (fields['name'] as Map?)?['stringValue'] as String?;
+        about = (fields['about'] as Map?)?['stringValue'] as String?;
+      }
+    } else if (meta.statusCode != 404) {
+      throw _httpFailure(meta);
+    }
+    return NialCloudRestore(entries: result, name: name, about: about);
+  }
+
+  static NialCloudEntry? _parseEntry(Object? document) {
+    if (document is! Map) return null;
+    final name = document['name'];
+    final fields = document['fields'];
+    if (name is! String || fields is! Map) return null;
+    final id = name.split('/').last;
+    if (!isValidId(id)) return null;
+    String? str(String key) => (fields[key] as Map?)?['stringValue'] as String?;
+    bool flag(String key) => (fields[key] as Map?)?['booleanValue'] == true;
+    final date = DateTime.tryParse(
+      (fields['date'] as Map?)?['timestampValue'] as String? ?? '',
+    );
+    final title = str('title');
+    final text = str('text');
+    if (title == null || text == null || date == null) return null;
+    return NialCloudEntry(
+      id: id,
+      title: title,
+      text: text,
+      date: date.toLocal(),
+      favorite: flag('favorite'),
+      photoCount:
+          int.tryParse('${(fields['photoCount'] as Map?)?['integerValue']}') ??
+          0,
+      hasVoice: flag('hasVoice'),
+      hasVideo: flag('hasVideo'),
+    );
+  }
+
+  NialCloudException _authFailure(http.Response response) {
+    final body = response.body;
+    const known = {
+      'EMAIL_EXISTS': 'Эта почта уже зарегистрирована. Войди в аккаунт.',
+      'INVALID_LOGIN_CREDENTIALS': 'Неверная почта или пароль.',
+      'INVALID_PASSWORD': 'Неверная почта или пароль.',
+      'EMAIL_NOT_FOUND': 'Неверная почта или пароль.',
+      'INVALID_EMAIL': 'Проверь адрес почты.',
+      'MISSING_PASSWORD': 'Введи пароль.',
+      'WEAK_PASSWORD': 'Пароль слишком простой: нужно минимум 6 символов.',
+      'TOO_MANY_ATTEMPTS_TRY_LATER': 'Слишком много попыток. Попробуй позже.',
+      'USER_DISABLED': 'Этот аккаунт отключён.',
+      'OPERATION_NOT_ALLOWED': 'Вход по почте пока недоступен.',
+      'CREDENTIAL_TOO_OLD_LOGIN_AGAIN': 'Войди в аккаунт заново.',
+      'PROVIDER_ALREADY_LINKED': 'К этому облаку уже привязана почта.',
+    };
+    for (final item in known.entries) {
+      if (body.contains(item.key)) return NialCloudException(item.value);
+    }
+    return _httpFailure(response);
+  }
 
   void dispose() {
     _disposed = true;
@@ -354,13 +692,16 @@ class NialCloudSync {
     final uploaded = pending.length;
     final removedIds = synced.keys.where((id) => !seen.contains(id)).toList();
     for (final id in removedIds) {
-      pending.add((
-        {'delete': '$base/entries/$id'},
-        id,
-        null,
-      ));
+      pending.add(({'delete': '$base/entries/$id'}, id, null));
     }
-    if (pending.isEmpty) return const NialCloudReport();
+    final profile = await _readProfile();
+    final profileJson = profile == null
+        ? null
+        : jsonEncode([profile.name, profile.about]);
+    final profileChanged =
+        profileJson != null &&
+        profileJson != await _store.read(_profileSentKey);
+    if (pending.isEmpty && !profileChanged) return const NialCloudReport();
 
     Map<String, dynamic> meta() => {
       'update': {
@@ -369,9 +710,19 @@ class NialCloudSync {
           'app': {'stringValue': 'nial_diary'},
           'entryCount': {'integerValue': '${entries.length}'},
           'updatedAt': {'timestampValue': now.toUtc().toIso8601String()},
+          if (profile != null) ...{
+            'name': {'stringValue': profile.name},
+            'about': {'stringValue': profile.about},
+          },
         },
       },
     };
+
+    if (pending.isEmpty) {
+      await _commit([meta()]);
+      await _store.write(_profileSentKey, profileJson);
+      return const NialCloudReport();
+    }
 
     var index = 0;
     while (index < pending.length) {
@@ -394,6 +745,7 @@ class NialCloudSync {
       }
       await _store.write(_syncedKey, jsonEncode(synced));
     }
+    if (profileJson != null) await _store.write(_profileSentKey, profileJson);
     return NialCloudReport(uploaded: uploaded, removed: removedIds.length);
   }
 
@@ -419,6 +771,29 @@ class NialCloudSync {
     await _store.write(_refreshKey, null);
     await _store.write(_uidKey, null);
     await _store.write(_syncedKey, null);
+    await _store.write(_profileSentKey, null);
+  }
+
+  Future<void> _clearAccount() async {
+    await _store.write(_enabledKey, null);
+    await _store.write(_lastSyncKey, null);
+    await _store.write(_emailKey, null);
+    await _store.write(_verifiedKey, null);
+  }
+
+  Future<NialCloudProfile?> _readProfile() async {
+    final snapshot = profileSnapshot;
+    if (snapshot == null) return null;
+    try {
+      final profile = await snapshot();
+      if (profile == null) return null;
+      return (
+        name: NialCloudEntry._cut(profile.name, 60),
+        about: NialCloudEntry._cut(profile.about, 160),
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _saveSession({
@@ -465,12 +840,18 @@ class NialCloudSync {
         );
         return idToken;
       }
-      const lost = [
-        'TOKEN_EXPIRED',
-        'USER_NOT_FOUND',
-        'INVALID_REFRESH_TOKEN',
-      ];
+      const lost = ['TOKEN_EXPIRED', 'USER_NOT_FOUND', 'INVALID_REFRESH_TOKEN'];
       if (response.statusCode == 400 && lost.any(response.body.contains)) {
+        if (await _store.read(_emailKey) != null) {
+          // Аккаунт с почтой нельзя молча заменить анонимным: просим войти.
+          _timer?.cancel();
+          await _clearSession();
+          await _clearAccount();
+          _setStatus(const NialCloudStatus(loaded: true, enabled: false));
+          throw const NialCloudException(
+            'Вход в аккаунт устарел. Войди по почте снова.',
+          );
+        }
         // Облачный профиль больше не существует: начинаем копию заново.
         await _clearSession();
       } else {
@@ -532,10 +913,7 @@ class NialCloudSync {
   }
 
   Future<void> _commit(List<Map<String, dynamic>> writes) async {
-    final uri = Uri.https(
-      'firestore.googleapis.com',
-      '/v1/$_documents:commit',
-    );
+    final uri = Uri.https('firestore.googleapis.com', '/v1/$_documents:commit');
     final body = jsonEncode({'writes': writes});
     var response = await _post(uri, body, json: true, token: await _token());
     if (response.statusCode == 401) {
