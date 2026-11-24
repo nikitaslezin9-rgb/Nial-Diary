@@ -148,6 +148,7 @@ class NialCloudSync {
     NialCloudStore? store,
     this.apiKey = nialCloudApiKey,
     this.projectId = nialCloudProjectId,
+    this.keyPrefix = nialCloudKeyPrefix,
     this.debounce = const Duration(seconds: 4),
   }) : _client = client ?? http.Client(),
        _store = store ?? _PreferencesCloudStore();
@@ -156,13 +157,19 @@ class NialCloudSync {
   final NialCloudStore _store;
   final String apiKey;
   final String projectId;
+
+  /// Приставка ключей настроек. Личная сборка: 'nial_' (прежние ключи).
+  final String keyPrefix;
   final Duration debounce;
 
-  static const _enabledKey = 'nial_cloud_enabled_v1';
-  static const _refreshKey = 'nial_cloud_refresh_token_v1';
-  static const _uidKey = 'nial_cloud_uid_v1';
-  static const _syncedKey = 'nial_cloud_synced_v1';
-  static const _lastSyncKey = 'nial_cloud_last_sync_v1';
+  /// Облако настроено для этой сборки (есть ключ и ID проекта).
+  bool get configured => apiKey.isNotEmpty && projectId.isNotEmpty;
+
+  String get _enabledKey => '${keyPrefix}cloud_enabled_v1';
+  String get _refreshKey => '${keyPrefix}cloud_refresh_token_v1';
+  String get _uidKey => '${keyPrefix}cloud_uid_v1';
+  String get _syncedKey => '${keyPrefix}cloud_synced_v1';
+  String get _lastSyncKey => '${keyPrefix}cloud_last_sync_v1';
   static const _timeout = Duration(seconds: 25);
   static const _maxWrites = 200;
   static const _maxBatchBytes = 4 * 1024 * 1024;
@@ -197,7 +204,7 @@ class NialCloudSync {
   /// Читает сохранённое состояние переключателя и время последней отправки.
   Future<void> load() async {
     try {
-      final enabled = await _store.read(_enabledKey) == '1';
+      final enabled = configured && await _store.read(_enabledKey) == '1';
       final last = DateTime.tryParse(await _store.read(_lastSyncKey) ?? '');
       _setStatus(
         status.value.copyWith(
@@ -213,6 +220,11 @@ class NialCloudSync {
   }
 
   Future<void> setEnabled(bool enabled) => _serial(() async {
+    if (enabled && !configured) {
+      throw const NialCloudException(
+        'Облако не настроено в этой сборке приложения.',
+      );
+    }
     await _store.write(_enabledKey, enabled ? '1' : null);
     if (!enabled) _timer?.cancel();
     _setStatus(status.value.copyWith(enabled: enabled, clearError: true));
@@ -234,7 +246,9 @@ class NialCloudSync {
   /// которых больше нет в дневнике.
   Future<NialCloudReport> sync(List<NialCloudEntry> entries) =>
       _serial(() async {
-        if (!status.value.enabled) return const NialCloudReport();
+        if (!status.value.enabled || !configured) {
+          return const NialCloudReport();
+        }
         _setStatus(status.value.copyWith(busy: true));
         try {
           final report = await _sync(entries);

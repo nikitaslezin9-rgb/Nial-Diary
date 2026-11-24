@@ -4,6 +4,15 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Публичная сборка определяется тем же флагом, что и в Dart-коде:
+// --dart-define=NIAL_EDITION=public. Она ставится отдельным приложением
+// (другой applicationId), поэтому не заменяет личную версию на телефоне
+// и не видит её записи и настройки облака.
+val nialPublicEdition = (project.findProperty("dart-defines") as String?)
+    ?.split(",")
+    ?.mapNotNull { runCatching { String(java.util.Base64.getDecoder().decode(it)) }.getOrNull() }
+    ?.contains("NIAL_EDITION=public") == true
+
 android {
     namespace = "com.nial.nial_diary"
     compileSdk = flutter.compileSdkVersion
@@ -27,6 +36,8 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        if (nialPublicEdition) applicationIdSuffix = ".community"
+        manifestPlaceholders["appLabel"] = "Nial Diary"
     }
 
     buildTypes {

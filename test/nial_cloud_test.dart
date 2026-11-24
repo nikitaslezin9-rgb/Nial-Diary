@@ -129,6 +129,50 @@ void main() {
   Iterable<String> entryDocs() =>
       cloud.documents.keys.where((name) => name.contains('/entries/'));
 
+  test('личная сборка сохраняет прежние ключи настроек', () async {
+    await sync.setEnabled(true);
+    expect(store.values['nial_cloud_enabled_v1'], '1');
+  });
+
+  test('публичная сборка не видит сессию и включение личной', () async {
+    await sync.load();
+    await sync.setEnabled(true);
+    await sync.sync([_entry('a', 'личное')]);
+    final public = NialCloudSync(
+      client: MockClient(cloud.handle),
+      store: store,
+      apiKey: 'key',
+      projectId: 'public-demo',
+      keyPrefix: 'nial_public_',
+      debounce: Duration.zero,
+    );
+    await public.load();
+    expect(public.status.value.enabled, isFalse);
+    final report = await public.sync([_entry('a', 'личное')]);
+    expect(report.uploaded, 0);
+    expect(cloud.signUps, 1);
+    expect(store.values.keys.where((k) => k.startsWith('nial_public_')), isEmpty);
+    public.dispose();
+  });
+
+  test('без настроек облака включить копию нельзя', () async {
+    final empty = NialCloudSync(
+      client: MockClient(cloud.handle),
+      store: store,
+      apiKey: '',
+      projectId: '',
+      keyPrefix: 'nial_public_',
+      debounce: Duration.zero,
+    );
+    store.values['nial_public_cloud_enabled_v1'] = '1';
+    await empty.load();
+    expect(empty.configured, isFalse);
+    expect(empty.status.value.enabled, isFalse);
+    await expectLater(empty.setEnabled(true), throwsA(isA<NialCloudException>()));
+    expect(cloud.signUps, 0);
+    empty.dispose();
+  });
+
   test('выключенная копия ничего не отправляет', () async {
     await sync.load();
     final report = await sync.sync([_entry('a', 'текст')]);
