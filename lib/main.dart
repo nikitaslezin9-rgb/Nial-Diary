@@ -15,6 +15,8 @@ import 'package:material_ui/material_ui.dart';
 
 import 'services/ai_config.dart';
 import 'services/diary_storage.dart';
+import 'services/nial_cloud.dart';
+import 'services/nial_cloud_panel.dart';
 import 'services/nial_media.dart';
 import 'services/nial_profile.dart';
 import 'services/nial_profile_card.dart';
@@ -22,6 +24,7 @@ import 'services/nial_motion.dart';
 import 'services/nial_palette.dart';
 
 import 'package:video_player/video_player.dart';
+import 'package:uuid/uuid.dart';
 
 import 'services/gigachat_service.dart';
 
@@ -36,8 +39,13 @@ class Entry {
     List<String>? photos,
     this.voice,
     this.video,
-  }) : photos = List<String>.from(photos ?? const []);
+    String? id,
+  }) : photos = List<String>.from(photos ?? const []),
+       id = id ?? const Uuid().v4();
 
+  /// Постоянный идентификатор записи: по нему облачная копия понимает,
+  /// какую запись изменили или удалили.
+  final String id;
   String title;
   String text;
   DateTime date;
@@ -46,6 +54,13 @@ class Entry {
   final String? voice;
   final String? video;
 }
+
+/// Возвращает сохранённый идентификатор записи, если он корректен и ещё
+/// не встречался; иначе null — тогда запись получит новый идентификатор.
+String? _readEntryId(dynamic value, Set<String> seen) =>
+    value is String && NialCloudSync.isValidId(value) && seen.add(value)
+    ? value
+    : null;
 
 List<String> _readEntryPhotos(dynamic value) {
   if (value == null) return [];
@@ -804,6 +819,7 @@ class _HomeState extends State<Home> {
     final profile = decoded.containsKey('profile')
         ? NialProfile.fromJson(decoded['profile'])
         : null;
+    final restoredIds = <String>{};
     final restored = items.map((item) {
       if (item is! Map<String, dynamic> ||
           item['title'] is! String ||
@@ -824,6 +840,7 @@ class _HomeState extends State<Home> {
         photos: _readEntryPhotos(item['photos']),
         video: _readEntryVideo(item['video']),
         voice: _readEntryVoice(item['voice']),
+        id: _readEntryId(item['id'], restoredIds),
       );
     }).toList();
     return (restored, profile);
@@ -894,6 +911,7 @@ class _HomeState extends State<Home> {
         restored
             .map(
               (e) => {
+                'id': e.id,
                 'title': e.title,
                 'text': e.text,
                 'date': e.date.toIso8601String(),
@@ -938,6 +956,7 @@ class _HomeState extends State<Home> {
         _diarySearchController.clear();
         onlyFavorites = false;
       });
+      _scheduleCloudSync();
       _backupNotice(
         'Восстановлено записей: ${restored.length}. Контекст ассистента выключен.',
       );
@@ -1053,6 +1072,27 @@ class _HomeState extends State<Home> {
   final _diaryStorage = DiaryStorage();
   Future<void> _saveQueue = Future<void>.value();
 
+  final _cloud = NialCloudSync();
+
+  List<NialCloudEntry> _cloudEntries() => [
+    for (final entry in entries)
+      NialCloudEntry(
+        id: entry.id,
+        title: entry.title,
+        text: entry.text,
+        date: entry.date,
+        favorite: entry.favorite,
+        photoCount: entry.photos.length,
+        hasVoice: entry.voice != null,
+        hasVideo: entry.video != null,
+      ),
+  ];
+
+  void _scheduleCloudSync() {
+    if (!_storageReady) return;
+    _cloud.schedule(_cloudEntries);
+  }
+
   bool _storageReady = false;
   String? _storageError;
 
@@ -1086,8 +1126,13 @@ class _HomeState extends State<Home> {
           throw const FormatException('Invalid diary data');
         }
 
+        final restoredIds = <String>{};
+        var idsAdded = false;
+
         final restored = decoded.map<Entry>((item) {
           final map = Map<String, dynamic>.from(item as Map);
+          final id = _readEntryId(map['id'], restoredIds);
+          if (id == null) idsAdded = true;
 
           return Entry(
             map['title'] as String,
@@ -1097,6 +1142,7 @@ class _HomeState extends State<Home> {
             photos: _readEntryPhotos(map['photos']),
             video: _readEntryVideo(map['video']),
             voice: _readEntryVoice(map['voice']),
+            id: id,
           );
         }).toList();
 
@@ -1107,6 +1153,12 @@ class _HomeState extends State<Home> {
         entries
           ..clear()
           ..addAll(restored);
+        if (idsAdded) {
+          // Старые записи получили постоянные идентификаторы: сохраняем их,
+          // чтобы они не менялись при следующем запуске.
+          await _diaryStorage.writeWithRecovery(_encodeDiary());
+          if (!mounted) return;
+        }
       } else {
         await _diaryStorage.write(_encodeDiary());
       }
@@ -1117,6 +1169,9 @@ class _HomeState extends State<Home> {
         _storageReady = true;
         _storageError = null;
       });
+
+      await _cloud.load();
+      _scheduleCloudSync();
     } catch (_) {
       if (!mounted) return;
 
@@ -1135,6 +1190,7 @@ class _HomeState extends State<Home> {
       entries
           .map(
             (entry) => {
+              'id': entry.id,
               'title': entry.title,
               'text': entry.text,
               'date': entry.date.toIso8601String(),
@@ -1161,6 +1217,7 @@ class _HomeState extends State<Home> {
 
     try {
       await operation;
+      _scheduleCloudSync();
     } catch (_) {
       if (!mounted) return;
 
@@ -1255,6 +1312,7 @@ class _HomeState extends State<Home> {
     _messageController.dispose();
     _scrollController.dispose();
     _aiService.dispose();
+    _cloud.dispose();
     super.dispose();
   }
 
@@ -2065,6 +2123,16 @@ class _HomeState extends State<Home> {
       ),
       const SizedBox(height: 10),
       _compactSettingsGroup(
+        'Облачная копия',
+        Icons.cloud_outlined,
+        NialCloudPanel(
+          cloud: _cloud,
+          snapshot: _cloudEntries,
+          locked: _backupBusy || !_storageReady,
+        ),
+      ),
+      const SizedBox(height: 10),
+      _compactSettingsGroup(
         'О приложении',
         Icons.info_outline,
         const Text(
@@ -2538,6 +2606,7 @@ class _EditorState extends State<Editor> {
         photos: _photos,
         voice: _voice,
         video: _video,
+        id: widget.entry?.id,
       ),
     );
   }
