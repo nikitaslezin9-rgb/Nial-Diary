@@ -1,0 +1,1329 @@
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'dart:convert';
+import 'dart:ui';
+
+import 'package:material_ui/material_ui.dart';
+
+import 'services/ai_config.dart';
+import 'services/diary_storage.dart';
+import 'services/gigachat_service.dart';
+
+void main() => runApp(const NialApp());
+
+class Entry {
+  Entry(this.title, this.text, this.date, {this.favorite = false});
+
+  String title;
+  String text;
+  DateTime date;
+  bool favorite;
+}
+
+const prompts = [
+  'Что сегодня хочется запомнить?',
+  'Какая мысль не выходит из головы?',
+  'Что тебя сегодня порадовало?',
+  'О чём сейчас хочется выговориться?',
+  'Какой момент дня ты бы сохранил?',
+  'Чего тебе сейчас не хватает?',
+  'За что ты можешь себя поблагодарить?',
+];
+
+class NialApp extends StatefulWidget {
+  const NialApp({super.key});
+
+  @override
+  State<NialApp> createState() => _NialAppState();
+}
+
+class _NialAppState extends State<NialApp> {
+  final _nialThemePreferences = SharedPreferencesAsync();
+
+  final _messengerKey = GlobalKey<ScaffoldMessengerState>();
+
+  Future<void> _themeSaveQueue = Future<void>.value();
+
+  ThemeMode mode = ThemeMode.system;
+  bool _themeLoaded = false;
+  bool _themeLoadFailed = false;
+
+  static const _themeKey = 'nial_theme_mode_v1';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTheme();
+  }
+
+  Future<void> _loadTheme() async {
+    try {
+      final saved = await _nialThemePreferences.getString(_themeKey);
+
+      if (!mounted) return;
+
+      setState(() {
+        mode = switch (saved) {
+          'light' => ThemeMode.light,
+          'dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        };
+
+        _themeLoaded = true;
+      });
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        mode = ThemeMode.system;
+        _themeLoaded = true;
+        _themeLoadFailed = true;
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_themeLoadFailed) return;
+
+        _messengerKey.currentState?.showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Не удалось загрузить тему. '
+              'Временно используется системное оформление.',
+            ),
+          ),
+        );
+      });
+    }
+  }
+
+  void _changeTheme(ThemeMode value) {
+    setState(() {
+      mode = value;
+    });
+
+    final savedValue = switch (value) {
+      ThemeMode.light => 'light',
+      ThemeMode.dark => 'dark',
+      ThemeMode.system => 'system',
+    };
+
+    _themeSaveQueue = _themeSaveQueue.then<void>((_) async {
+      try {
+        await _nialThemePreferences.setString(_themeKey, savedValue);
+      } catch (_) {
+        if (!mounted) return;
+
+        _messengerKey.currentState?.showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Тема применена, но сохранить её не удалось. '
+              'Попробуй выбрать оформление ещё раз.',
+            ),
+          ),
+        );
+      }
+    });
+  }
+
+  ThemeData theme(bool dark) => ThemeData(
+    useMaterial3: true,
+    brightness: dark ? Brightness.dark : Brightness.light,
+    scaffoldBackgroundColor: dark
+        ? const Color(0xff171d18)
+        : const Color(0xfff3f2e9),
+    colorScheme:
+        ColorScheme.fromSeed(
+          seedColor: const Color(0xff819576),
+          brightness: dark ? Brightness.dark : Brightness.light,
+        ).copyWith(
+          surface: dark ? const Color(0xff222b23) : const Color(0xfffffdf8),
+          onSurface: dark ? const Color(0xffedf0e6) : const Color(0xff344635),
+          primary: dark ? const Color(0xffc8d8b9) : const Color(0xff344635),
+          onPrimary: dark ? const Color(0xff1e2a1d) : const Color(0xfffffdf7),
+        ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Nial Dairy',
+      debugShowCheckedModeBanner: false,
+      scaffoldMessengerKey: _messengerKey,
+      theme: theme(false),
+      darkTheme: theme(true),
+      themeMode: mode,
+      home: _themeLoaded
+          ? Home(mode: mode, changeTheme: _changeTheme)
+          : const Scaffold(body: Center(child: CircularProgressIndicator())),
+    );
+  }
+}
+
+class Home extends StatefulWidget {
+  const Home({super.key, required this.mode, required this.changeTheme});
+
+  final ThemeMode mode;
+  final ValueChanged<ThemeMode> changeTheme;
+
+  @override
+  State<Home> createState() => _HomeState();
+}
+
+class _HomeState extends State<Home> {
+  final _diaryStorage = DiaryStorage();
+  Future<void> _saveQueue = Future<void>.value();
+
+  bool _storageReady = false;
+  String? _storageError;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDiary();
+  }
+
+  Future<void> _loadDiary() async {
+    if (mounted) {
+      setState(() {
+        _storageReady = false;
+        _storageError = null;
+      });
+    }
+
+    try {
+      final saved = await _diaryStorage.read();
+
+      if (!mounted) return;
+
+      if (saved != null) {
+        final decoded = jsonDecode(saved);
+
+        if (decoded is! List) {
+          throw const FormatException('Invalid diary data');
+        }
+
+        final restored = decoded.map<Entry>((item) {
+          final map = Map<String, dynamic>.from(item as Map);
+
+          return Entry(
+            map['title'] as String,
+            map['text'] as String,
+            DateTime.parse(map['date'] as String),
+            favorite: map['favorite'] as bool? ?? false,
+          );
+        }).toList();
+
+        entries
+          ..clear()
+          ..addAll(restored);
+      } else {
+        await _diaryStorage.write(_encodeDiary());
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _storageReady = true;
+        _storageError = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        _storageReady = false;
+        _storageError =
+            'Не удалось открыть сохранённый дневник. '
+            'Существующая база не перезаписана. '
+            'Попробуй повторить загрузку.';
+      });
+    }
+  }
+
+  String _encodeDiary() {
+    return jsonEncode(
+      entries
+          .map(
+            (entry) => {
+              'title': entry.title,
+              'text': entry.text,
+              'date': entry.date.toIso8601String(),
+              'favorite': entry.favorite,
+            },
+          )
+          .toList(),
+    );
+  }
+
+  Future<void> _saveDiary() async {
+    final snapshot = _encodeDiary();
+
+    final operation = _saveQueue.then((_) => _diaryStorage.write(snapshot));
+
+    _saveQueue = operation.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {},
+    );
+
+    try {
+      await operation;
+    } catch (_) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 8),
+          content: const Text(
+            'Не удалось сохранить последние изменения. '
+            'Не закрывай приложение и попробуй ещё раз.',
+          ),
+          action: SnackBarAction(
+            label: 'Повторить',
+            onPressed: () {
+              _saveDiary();
+            },
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleFavorite(Entry entry) async {
+    if (!_storageReady) return;
+
+    setState(() {
+      entry.favorite = !entry.favorite;
+    });
+
+    await _saveDiary();
+  }
+
+  int page = 0;
+  int question = 0;
+  bool onlyFavorites = false;
+
+  final _aiService = GigaChatService(
+    authorizationKey: gigaChatAuthorizationKey,
+  );
+
+  final _messageController = TextEditingController();
+  final _scrollController = ScrollController();
+  final _composerKey = GlobalKey();
+
+  final List<Map<String, String>> _chatMessages = [];
+
+  bool _isSending = false;
+  String? _chatError;
+
+  final entries = <Entry>[
+    Entry(
+      'Маленькие хорошие вещи',
+      'Утро без спешки, любимая музыка и немного времени для себя. '
+          'Иногда именно из таких мелочей складывается хороший день.',
+      DateTime.now(),
+      favorite: true,
+    ),
+    Entry(
+      'Просто выговориться',
+      'Не обязательно сразу находить ответы. Сегодня захотелось '
+          'просто оставить мысли здесь и немного выдохнуть.',
+      DateTime.now().subtract(const Duration(days: 1)),
+    ),
+    Entry(
+      'Планы без спешки',
+      'Хочу чаще замечать то, что уже получается. '
+          'Не требовать от себя всего сразу и оставить место '
+          'для простых радостей.',
+      DateTime.now().subtract(const Duration(days: 2)),
+    ),
+    Entry(
+      'То, за что я благодарен',
+      'За людей, с которыми можно быть собой. '
+          'За спокойный вечер и возможность начать заново.',
+      DateTime.now().subtract(const Duration(days: 3)),
+      favorite: true,
+    ),
+  ];
+
+  bool get dark => Theme.of(context).brightness == Brightness.dark;
+
+  Color get sage => dark ? const Color(0xff334535) : const Color(0xffdce5d3);
+
+  Color get muted => dark ? const Color(0xffa1ae9b) : const Color(0xff798571);
+
+  Color get accent => dark ? const Color(0xffd8b79a) : const Color(0xfff1dbc9);
+
+  TextStyle get small => TextStyle(color: muted, fontSize: 12, height: 1.7);
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    _scrollController.dispose();
+    _aiService.dispose();
+    super.dispose();
+  }
+
+  String date(DateTime d) {
+    const months = [
+      'января',
+      'февраля',
+      'марта',
+      'апреля',
+      'мая',
+      'июня',
+      'июля',
+      'августа',
+      'сентября',
+      'октября',
+      'ноября',
+      'декабря',
+    ];
+
+    return '${d.day} ${months[d.month - 1]}';
+  }
+
+  Future<void> edit([Entry? old]) async {
+    if (!_storageReady) return;
+
+    final result = await Navigator.of(context).push<Entry>(
+      MaterialPageRoute(
+        builder: (_) => Editor(entry: old, question: question),
+      ),
+    );
+
+    if (!mounted || result == null) return;
+
+    setState(() {
+      if (old == null) {
+        entries.insert(0, result);
+      } else {
+        final index = entries.indexOf(old);
+        if (index >= 0) {
+          entries[index] = result;
+        }
+      }
+    });
+
+    await _saveDiary();
+  }
+
+  void _showComposer() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || page != 1) return;
+
+      final target = _composerKey.currentContext;
+      if (target == null) return;
+
+      Scrollable.ensureVisible(
+        target,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+        alignment: 0.6,
+      );
+    });
+  }
+
+  Future<void> _sendMessage() async {
+    final message = _messageController.text.trim();
+
+    if (message.isEmpty || _isSending) return;
+
+    final history = _chatMessages
+        .map((item) => Map<String, String>.from(item))
+        .toList();
+
+    FocusScope.of(context).unfocus();
+
+    setState(() {
+      _isSending = true;
+      _chatError = null;
+      _chatMessages.add({'role': 'user', 'content': message});
+      _messageController.clear();
+    });
+
+    _showComposer();
+
+    try {
+      final answer = await _aiService.getResponse(message, history: history);
+
+      if (!mounted) return;
+
+      setState(() {
+        _chatMessages.add({'role': 'assistant', 'content': answer});
+        _isSending = false;
+      });
+
+      _showComposer();
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        _chatMessages.removeLast();
+        _messageController.text = message;
+        _isSending = false;
+        _chatError = error.toString().replaceFirst('Exception: ', '');
+      });
+
+      _showComposer();
+    }
+  }
+
+  Future<void> _confirmClearChat() async {
+    if (_isSending || _chatMessages.isEmpty) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Очистить беседу?'),
+        content: const Text(
+          'Сообщения исчезнут из текущего чата приложения. '
+          'Записи дневника останутся без изменений. '
+          'Это не запрос на удаление данных у провайдера ИИ.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Очистить'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted || confirmed != true) return;
+
+    setState(() {
+      _chatMessages.clear();
+      _chatError = null;
+    });
+  }
+
+  Widget box(Widget child, {Color? color}) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(20),
+    decoration: BoxDecoration(
+      color: color ?? Theme.of(context).colorScheme.surface,
+      borderRadius: BorderRadius.circular(25),
+      border: Border.all(
+        color: dark ? const Color(0xff354036) : const Color(0xffe1e6d8),
+      ),
+    ),
+    child: child,
+  );
+
+  Widget filter(String label, bool favorite) => TextButton(
+    onPressed: () => setState(() => onlyFavorites = favorite),
+    style: TextButton.styleFrom(
+      backgroundColor: onlyFavorites == favorite
+          ? Theme.of(context).colorScheme.surface
+          : Colors.transparent,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
+    ),
+    child: Text(label, style: const TextStyle(fontSize: 12)),
+  );
+
+  Widget entryCard(Entry e) => Padding(
+    padding: const EdgeInsets.only(bottom: 14),
+    child: box(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(child: Text(date(e.date), style: small)),
+              IconButton(
+                tooltip: e.favorite
+                    ? 'Убрать из избранного'
+                    : 'Добавить в избранное',
+                style: IconButton.styleFrom(
+                  backgroundColor: e.favorite ? accent : sage,
+                  foregroundColor: e.favorite ? const Color(0xff584536) : null,
+                ),
+                onPressed: () => _toggleFavorite(e),
+                icon: Icon(
+                  e.favorite
+                      ? Icons.bookmark_rounded
+                      : Icons.bookmark_border_rounded,
+                  size: 20,
+                ),
+              ),
+            ],
+          ),
+          InkWell(
+            onTap: () => edit(e),
+            borderRadius: BorderRadius.circular(12),
+            child: SizedBox(
+              width: double.infinity,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      e.title.isEmpty ? 'Без названия' : e.title,
+                      style: const TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (e.text.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        e.text,
+                        maxLines: 5,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 14,
+                          height: 1.7,
+                          color: muted,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget diary() {
+    final visible = entries.where((e) => !onlyFavorites || e.favorite).toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        box(
+          Column(
+            children: [
+              Text(
+                'ТВОЁ ЛИЧНОЕ ПРОСТРАНСТВО',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 10,
+                  letterSpacing: 1.5,
+                  color: muted,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Твоя история.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 33,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -1.5,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Мысли, которые хочется сохранить.',
+                textAlign: TextAlign.center,
+                style: small,
+              ),
+              const SizedBox(height: 24),
+              ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 58),
+                child: Center(
+                  child: Text(
+                    prompts[question],
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 19, height: 1.5),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                alignment: WrapAlignment.center,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 6,
+                children: [
+                  FilledButton(
+                    onPressed: () => edit(),
+                    child: const Text('Написать'),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(
+                      () => question = (question + 1) % prompts.length,
+                    ),
+                    child: const Text('Другой вопрос ↻'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          color: sage,
+        ),
+        const SizedBox(height: 22),
+        Row(
+          children: [
+            filter('Все записи', false),
+            filter('Избранное', true),
+            const Spacer(),
+            Text('${visible.length}', style: small),
+          ],
+        ),
+        const SizedBox(height: 16),
+        if (visible.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 45),
+            child: Text(
+              'Здесь пока нет записей.',
+              textAlign: TextAlign.center,
+              style: small,
+            ),
+          ),
+        ...visible.map(entryCard),
+        Text(
+          'Записи и избранное сохраняются на устройстве. '
+          'Выбранное оформление также сохраняется.',
+          style: small,
+        ),
+      ],
+    );
+  }
+
+  Widget chatBubble(Map<String, String> message) {
+    final isUser = message['role'] == 'user';
+
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: 14,
+        left: isUser ? 24 : 0,
+        right: isUser ? 0 : 24,
+      ),
+      child: box(
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  isUser
+                      ? Icons.person_outline_rounded
+                      : Icons.auto_awesome_outlined,
+                  size: 16,
+                  color: muted,
+                ),
+                const SizedBox(width: 7),
+                Text(
+                  isUser ? 'Ты' : 'Ассистент',
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            SelectableText(
+              message['content'] ?? '',
+              style: const TextStyle(fontSize: 15, height: 1.65),
+            ),
+          ],
+        ),
+        color: isUser ? sage : null,
+      ),
+    );
+  }
+
+  Widget assistant() {
+    final colors = Theme.of(context).colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Давай поговорим.',
+                style: TextStyle(fontSize: 29, fontWeight: FontWeight.w600),
+              ),
+            ),
+            IconButton(
+              tooltip: 'Очистить беседу',
+              onPressed: _isSending || _chatMessages.isEmpty
+                  ? null
+                  : _confirmClearChat,
+              icon: const Icon(Icons.delete_outline_rounded),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Text(
+          'Отправляя сообщение, ты передаёшь его и историю '
+          'текущей беседы сервису GigaChat для создания ответа. '
+          'Записи дневника пока не отправляются.',
+          style: small,
+        ),
+        const SizedBox(height: 20),
+        if (_chatMessages.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: box(
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.auto_awesome_outlined, size: 28),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Здесь можно начать с любой мысли.',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      height: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Расскажи, как прошёл день, или попроси '
+                    'помочь сформулировать первую запись.',
+                    style: TextStyle(color: muted, height: 1.7),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      ActionChip(
+                        label: const Text('Начать запись'),
+                        onPressed: () {
+                          _messageController.text =
+                              'Помоги мне начать запись в дневнике. '
+                              'Задай один простой вопрос.';
+                          _showComposer();
+                        },
+                      ),
+                      ActionChip(
+                        label: const Text('Разобраться в мыслях'),
+                        onPressed: () {
+                          _messageController.text =
+                              'Хочу разобраться в своих мыслях. '
+                              'Помоги начать разговор.';
+                          _showComposer();
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              color: sage,
+            ),
+          ),
+        ..._chatMessages.map(chatBubble),
+        if (_isSending)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: box(
+              Row(
+                children: [
+                  SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: colors.primary,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text('Думаю…'),
+                ],
+              ),
+            ),
+          ),
+        if (_chatError != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: box(
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Не удалось получить ответ',
+                    style: TextStyle(
+                      color: colors.error,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    _chatError!,
+                    style: TextStyle(
+                      color: colors.error,
+                      fontSize: 12,
+                      height: 1.6,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Сообщение возвращено в поле ввода. '
+                    'Можно попробовать отправить его ещё раз.',
+                    style: TextStyle(fontSize: 12, height: 1.6),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        Container(
+          key: _composerKey,
+          child: box(
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                TextField(
+                  controller: _messageController,
+                  enabled: !_isSending,
+                  minLines: 2,
+                  maxLines: 6,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: const TextStyle(fontSize: 15, height: 1.6),
+                  decoration: const InputDecoration(
+                    hintText: 'О чём сейчас думаешь?',
+                    border: InputBorder.none,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton.icon(
+                    onPressed: _isSending ? null : _sendMessage,
+                    icon: Icon(
+                      _isSending
+                          ? Icons.hourglass_empty_rounded
+                          : Icons.arrow_upward_rounded,
+                      size: 19,
+                    ),
+                    label: Text(_isSending ? 'Отправляется…' : 'Отправить'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Беседа не сохраняется после полного перезапуска. '
+          'ИИ может ошибаться.',
+          style: small,
+        ),
+      ],
+    );
+  }
+
+  Widget settings() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      const Text(
+        'Твоё пространство.',
+        style: TextStyle(fontSize: 29, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 22),
+      box(
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Оформление',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 7,
+              runSpacing: 7,
+              children: [
+                for (final item in [
+                  (ThemeMode.system, 'Система'),
+                  (ThemeMode.light, 'Светлая'),
+                  (ThemeMode.dark, 'Тёмная'),
+                ])
+                  ChoiceChip(
+                    label: Text(item.$2),
+                    selected: widget.mode == item.$1,
+                    onSelected: (_) => widget.changeTheme(item.$1),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      const SizedBox(height: 16),
+      box(
+        const Text(
+          'Nial Dairy\n\n'
+          'Личный дневник без карт и прогулок.\n\n'
+          'Ассистент подключён к сервису GigaChat через API. '
+          'Для ответов требуется интернет. '
+          'Записи дневника пока не передаются ассистенту.\n\n'
+          'Фото, видео и голосовые '
+          'добавим следующими этапами.',
+          style: TextStyle(height: 1.7),
+        ),
+      ),
+    ],
+  );
+
+  Widget navItem(IconData icon, String text, int index) => Expanded(
+    child: Semantics(
+      selected: page == index,
+      child: InkWell(
+        onTap: () {
+          FocusScope.of(context).unfocus();
+          setState(() => page = index);
+        },
+        borderRadius: BorderRadius.circular(19),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 9),
+          decoration: BoxDecoration(
+            color: page == index
+                ? Colors.white.withValues(alpha: dark ? .07 : .22)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(19),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 22),
+              const SizedBox(height: 5),
+              Text(text, style: const TextStyle(fontSize: 10)),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  Widget navigation() => Container(
+    decoration: BoxDecoration(
+      borderRadius: BorderRadius.circular(30),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: .15),
+          blurRadius: 30,
+          offset: const Offset(0, 12),
+        ),
+      ],
+    ),
+    child: ClipRRect(
+      borderRadius: BorderRadius.circular(30),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 9, sigmaY: 9),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+          decoration: BoxDecoration(
+            color: dark
+                ? const Color(0xff131c15).withValues(alpha: .22)
+                : const Color(0xfffffff9).withValues(alpha: .13),
+            borderRadius: BorderRadius.circular(30),
+            border: Border.all(
+              color: Colors.white.withValues(alpha: dark ? .16 : .6),
+            ),
+          ),
+          child: Row(
+            children: [
+              navItem(Icons.auto_stories_outlined, 'Дневник', 0),
+              const SizedBox(width: 5),
+              SizedBox(
+                width: 48,
+                height: 48,
+                child: IconButton.filled(
+                  onPressed: () => edit(),
+                  tooltip: 'Создать запись',
+                  style: IconButton.styleFrom(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                  icon: const Icon(Icons.add, size: 28),
+                ),
+              ),
+              const SizedBox(width: 5),
+              navItem(Icons.auto_awesome_outlined, 'Ассистент', 1),
+              navItem(Icons.tune_rounded, 'Настройки', 2),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_storageReady) {
+      return Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: _storageError == null
+                  ? const Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CircularProgressIndicator(),
+                        SizedBox(height: 18),
+                        Text('Открываем твой дневник…'),
+                      ],
+                    )
+                  : Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(_storageError!, textAlign: TextAlign.center),
+                        const SizedBox(height: 18),
+                        FilledButton(
+                          onPressed: _loadDiary,
+                          child: const Text('Повторить загрузку'),
+                        ),
+                      ],
+                    ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    final bottom = MediaQuery.paddingOf(context).bottom;
+    final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
+
+    return Scaffold(
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: SafeArea(
+              bottom: false,
+              child: SingleChildScrollView(
+                controller: _scrollController,
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
+                padding: EdgeInsets.fromLTRB(
+                  22,
+                  26,
+                  22,
+                  keyboardOpen ? 28 : 145 + bottom,
+                ),
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 460),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Nial Dairy',
+                                    style: TextStyle(
+                                      fontSize: 25,
+                                      fontWeight: FontWeight.w800,
+                                      letterSpacing: -1,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 5),
+                                  Text(
+                                    'МЕСТО ДЛЯ ТВОИХ МЫСЛЕЙ',
+                                    style: TextStyle(
+                                      fontSize: 9,
+                                      letterSpacing: 1.4,
+                                      color: muted,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Container(
+                              width: 44,
+                              height: 44,
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: accent,
+                                borderRadius: BorderRadius.circular(17),
+                              ),
+                              child: const Text(
+                                'N',
+                                style: TextStyle(color: Color(0xff584536)),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 28),
+                        if (page == 0) diary(),
+                        if (page == 1) assistant(),
+                        if (page == 2) settings(),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (!keyboardOpen)
+            Positioned(
+              left: 18,
+              right: 18,
+              bottom: 18 + bottom,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 436),
+                  child: navigation(),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class Editor extends StatefulWidget {
+  const Editor({super.key, this.entry, required this.question});
+
+  final Entry? entry;
+  final int question;
+
+  @override
+  State<Editor> createState() => _EditorState();
+}
+
+class _EditorState extends State<Editor> {
+  late final TextEditingController title;
+  late final TextEditingController text;
+  late bool favorite;
+  late int question;
+
+  @override
+  void initState() {
+    super.initState();
+    title = TextEditingController(text: widget.entry?.title ?? '');
+    text = TextEditingController(text: widget.entry?.text ?? '');
+    favorite = widget.entry?.favorite ?? false;
+    question = widget.question;
+  }
+
+  @override
+  void dispose() {
+    title.dispose();
+    text.dispose();
+    super.dispose();
+  }
+
+  void save() {
+    if (title.text.trim().isEmpty && text.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Добавь название или текст')),
+      );
+      return;
+    }
+
+    Navigator.of(context).pop(
+      Entry(
+        title.text.trim(),
+        text.text.trim(),
+        widget.entry?.date ?? DateTime.now(),
+        favorite: favorite,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: theme.scaffoldBackgroundColor,
+        surfaceTintColor: Colors.transparent,
+        title: Text(widget.entry == null ? 'Новая запись' : 'Твоя запись'),
+        actions: [
+          IconButton(
+            tooltip: 'Избранное',
+            onPressed: () => setState(() => favorite = !favorite),
+            icon: Icon(
+              favorite ? Icons.bookmark_rounded : Icons.bookmark_border_rounded,
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 500),
+            child: ListView(
+              padding: const EdgeInsets.all(22),
+              children: [
+                TextField(
+                  controller: title,
+                  maxLines: null,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: const TextStyle(
+                    fontSize: 25,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  decoration: const InputDecoration(
+                    hintText: 'Дай мысли название…',
+                    border: InputBorder.none,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                if (text.text.trim().isEmpty)
+                  Container(
+                    padding: const EdgeInsets.all(17),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.primary.withValues(alpha: .12),
+                      borderRadius: BorderRadius.circular(19),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          prompts[question],
+                          style: const TextStyle(height: 1.6),
+                        ),
+                        TextButton(
+                          onPressed: () => setState(
+                            () => question = (question + 1) % prompts.length,
+                          ),
+                          child: const Text('Другой вопрос ↻'),
+                        ),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: text,
+                  onChanged: (_) => setState(() {}),
+                  minLines: 8,
+                  maxLines: null,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: const TextStyle(fontSize: 16, height: 1.7),
+                  decoration: const InputDecoration(
+                    hintText: 'Здесь можно быть собой…',
+                    border: InputBorder.none,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: save,
+                  child: const Text('Сохранить запись'),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Записи сохраняются в локальной базе на устройстве. '
+                  'Медиа добавим следующим этапом.',
+                  style: TextStyle(fontSize: 12, height: 1.6),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,92 @@
+import 'package:path/path.dart' as p;
+import 'package:sqflite/sqflite.dart';
+
+class DiaryStorage {
+  static Future<Database>? _databaseFuture;
+
+  Future<Database> _database() async {
+    final existing = _databaseFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    final opening = _openDatabase();
+    _databaseFuture = opening;
+
+    try {
+      return await opening;
+    } catch (_) {
+      _databaseFuture = null;
+      rethrow;
+    }
+  }
+
+  Future<Database> _openDatabase() async {
+    final directory = await getDatabasesPath();
+
+    return openDatabase(
+      p.join(directory, 'nial_diary.sqlite'),
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute(
+          'CREATE TABLE diary_snapshot ('
+          'id INTEGER PRIMARY KEY, '
+          'payload TEXT NOT NULL'
+          ')',
+        );
+      },
+    );
+  }
+
+  Future<String?> read() async {
+    final db = await _database();
+
+    final rows = await db.query(
+      'diary_snapshot',
+      columns: ['payload'],
+      where: 'id = ?',
+      whereArgs: [1],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+
+    return rows.first['payload'] as String;
+  }
+
+  Future<void> write(String payload) async {
+    final db = await _database();
+
+    await db.transaction((transaction) async {
+      await transaction.insert('diary_snapshot', {
+        'id': 1,
+        'payload': payload,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    });
+  }
+
+  Future<void> writeWithRecovery(String payload) async {
+    final db = await _database();
+    await db.transaction((transaction) async {
+      final rows = await transaction.query(
+        'diary_snapshot',
+        columns: ['payload'],
+        where: 'id = ?',
+        whereArgs: [1],
+        limit: 1,
+      );
+      if (rows.isNotEmpty) {
+        await transaction.insert('diary_snapshot', {
+          'id': 2,
+          'payload': rows.first['payload'],
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      await transaction.insert('diary_snapshot', {
+        'id': 1,
+        'payload': payload,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    });
+  }
+}

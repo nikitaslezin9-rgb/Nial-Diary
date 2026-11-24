@@ -1,0 +1,435 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
+import 'package:uuid/uuid.dart';
+
+class GigaChatService {
+  GigaChatService({
+    required String authorizationKey,
+    this.model = 'GigaChat-3-Ultra',
+  }) : _authorizationKey = authorizationKey.trim();
+
+  final String _authorizationKey;
+  final String model;
+
+  final Uuid _uuid = const Uuid();
+
+  http.Client? _client;
+  Future<http.Client>? _clientRequest;
+  Future<String>? _tokenRequest;
+
+  String? _accessToken;
+  int _expiresAt = 0;
+  bool _disposed = false;
+
+  static const String _certificateAsset =
+      'assets/certificates/russian_trusted_root_ca_pem.crt';
+
+  static final Uri _tokenUri = Uri.parse(
+    'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
+  );
+
+  static final Uri _chatUri = Uri.parse(
+    'https://api.giga.chat/v1/chat/completions',
+  );
+
+  static const String _systemPrompt =
+      'Ты — помощник в приложении Nial Dairy, личном дневнике. '
+      'Отвечай по-русски, тепло, ясно и без навязчивости. '
+      'Помогай пользователю размышлять, замечать чувства '
+      'и формулировать мысли. '
+      'Не ставь диагнозы и не назначай лекарства. '
+      'Не выдумывай события и факты о пользователе. '
+      'Если записи дневника не переданы в сообщениях, '
+      'не утверждай, что прочитал их или имеешь к ним доступ. '
+      'Не заканчивай каждый ответ обязательным вопросом.';
+
+  void _ensureActive() {
+    if (_disposed) {
+      throw const GigaChatException(
+        'Подключение ассистента уже закрыто. '
+        'Открой приложение заново.',
+      );
+    }
+  }
+
+  Future<http.Client> _getClient() async {
+    _ensureActive();
+
+    final existing = _client;
+    if (existing != null) {
+      return existing;
+    }
+
+    final pending = _clientRequest;
+    if (pending != null) {
+      return pending;
+    }
+
+    final request = _createClient();
+    _clientRequest = request;
+
+    try {
+      return await request;
+    } finally {
+      _clientRequest = null;
+    }
+  }
+
+  Future<http.Client> _createClient() async {
+    final ByteData certificate;
+
+    try {
+      certificate = await rootBundle.load(_certificateAsset);
+    } catch (_) {
+      throw const GigaChatException(
+        'Не найден сертификат GigaChat. '
+        'Проверь файл в assets/certificates и раздел assets '
+        'в pubspec.yaml, затем полностью перезапусти приложение.',
+      );
+    }
+
+    _ensureActive();
+
+    final context = SecurityContext(withTrustedRoots: true);
+
+    try {
+      context.setTrustedCertificatesBytes(
+        certificate.buffer.asUint8List(
+          certificate.offsetInBytes,
+          certificate.lengthInBytes,
+        ),
+      );
+    } catch (_) {
+      throw const GigaChatException(
+        'Не удалось прочитать сертификат GigaChat. '
+        'Проверь, что скачан сертификат в формате PEM, '
+        'а не страница сайта.',
+      );
+    }
+
+    final nativeClient = HttpClient(context: context)
+      ..connectionTimeout = const Duration(seconds: 30);
+
+    final client = IOClient(nativeClient);
+    _client = client;
+
+    return client;
+  }
+
+  Future<String> _getToken() async {
+    _ensureActive();
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final token = _accessToken;
+
+    if (token != null && now < _expiresAt - 60000) {
+      return token;
+    }
+
+    final pending = _tokenRequest;
+    if (pending != null) {
+      return pending;
+    }
+
+    final request = _fetchToken();
+    _tokenRequest = request;
+
+    try {
+      return await request;
+    } finally {
+      _tokenRequest = null;
+    }
+  }
+
+  Future<String> _fetchToken() async {
+    if (_authorizationKey.isEmpty ||
+        _authorizationKey == 'ВСТАВЬ_КЛЮЧ_ЗДЕСЬ' ||
+        _authorizationKey == 'ТВОЙ_КЛЮЧ') {
+      throw const GigaChatException(
+        'Не указан ключ GigaChat. '
+        'Добавь Authorization Key в ai_config.dart.',
+      );
+    }
+
+    final client = await _getClient();
+
+    final response = await client
+        .post(
+          _tokenUri,
+          headers: {
+            'Authorization': 'Basic $_authorizationKey',
+            'RqUID': _uuid.v4(),
+            'Accept': 'application/json',
+          },
+          body: {'scope': 'GIGACHAT_API_PERS'},
+        )
+        .timeout(const Duration(seconds: 30));
+
+    _ensureActive();
+
+    if (response.statusCode != 200) {
+      throw GigaChatException(
+        _httpError(response.statusCode, gettingToken: true),
+      );
+    }
+
+    final data = _decodeObject(response);
+
+    final token = data['access_token'];
+    final expiresAt = data['expires_at'];
+
+    if (token is! String || token.isEmpty || expiresAt is! num) {
+      throw const GigaChatException(
+        'GigaChat вернул некорректные данные авторизации.',
+      );
+    }
+
+    _accessToken = token;
+    _expiresAt = expiresAt.toInt();
+
+    return token;
+  }
+
+  Future<String> getResponse(
+    String message, {
+    List<Map<String, String>> history = const [],
+  }) async {
+    try {
+      _ensureActive();
+
+      final text = message.trim();
+
+      if (text.isEmpty) {
+        throw const GigaChatException('Сначала введи сообщение.');
+      }
+
+      final messages = <Map<String, String>>[
+        {'role': 'system', 'content': _systemPrompt},
+        ...history
+            .where(
+              (item) =>
+                  (item['role'] == 'user' || item['role'] == 'assistant') &&
+                  (item['content']?.trim().isNotEmpty ?? false),
+            )
+            .map(
+              (item) => <String, String>{
+                'role': item['role']!,
+                'content': item['content']!,
+              },
+            ),
+        {'role': 'user', 'content': text},
+      ];
+
+      for (var attempt = 0; attempt < 2; attempt++) {
+        final token = await _getToken();
+        final client = await _getClient();
+
+        final response = await client
+            .post(
+              _chatUri,
+              headers: {
+                'Authorization': 'Bearer $token',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: jsonEncode({
+                'model': model,
+                'messages': messages,
+                'temperature': 0.7,
+                'max_tokens': 700,
+                'stream': false,
+              }),
+            )
+            .timeout(const Duration(seconds: 90));
+
+        _ensureActive();
+
+        if (response.statusCode == 401 && attempt == 0) {
+          _accessToken = null;
+          _expiresAt = 0;
+          continue;
+        }
+
+        if (response.statusCode != 200) {
+          throw GigaChatException(_httpError(response.statusCode));
+        }
+
+        final data = _decodeObject(response);
+        final choices = data['choices'];
+
+        if (choices is! List || choices.isEmpty) {
+          throw const GigaChatException(
+            'GigaChat вернул пустой ответ. Попробуй ещё раз.',
+          );
+        }
+
+        final first = choices.first;
+
+        if (first is! Map) {
+          throw const GigaChatException('Не удалось разобрать ответ GigaChat.');
+        }
+
+        final responseMessage = first['message'];
+
+        if (responseMessage is! Map) {
+          throw const GigaChatException(
+            'В ответе GigaChat отсутствует сообщение.',
+          );
+        }
+
+        final content = responseMessage['content'];
+
+        if (content is! String || content.trim().isEmpty) {
+          throw const GigaChatException(
+            'GigaChat не вернул текст. Попробуй другой вопрос.',
+          );
+        }
+
+        return content.trim();
+      }
+
+      throw const GigaChatException(
+        'Не удалось обновить авторизацию GigaChat.',
+      );
+    } on GigaChatException {
+      rethrow;
+    } on HandshakeException {
+      throw const GigaChatException(
+        'Не удалось проверить сертификат защищённого соединения. '
+        'Проверь сертификат GigaChat, дату и время на телефоне. '
+        'Если используешь VPN или фильтрацию HTTPS, '
+        'проверь соединение без них.',
+      );
+    } on TimeoutException {
+      throw const GigaChatException(
+        'Сервис слишком долго не отвечает. '
+        'Проверь интернет и попробуй ещё раз.',
+      );
+    } on SocketException {
+      throw const GigaChatException(
+        'Не удалось подключиться к GigaChat. '
+        'Проверь интернет или попробуй другую сеть.',
+      );
+    } on http.ClientException {
+      throw const GigaChatException(
+        'Соединение с GigaChat прервалось '
+        'или не было установлено. Попробуй ещё раз.',
+      );
+    } on FormatException {
+      throw const GigaChatException(
+        'Сервис вернул ответ в неожиданном формате. '
+        'Попробуй повторить запрос.',
+      );
+    } catch (_) {
+      throw const GigaChatException(
+        'Произошла непредвиденная ошибка ассистента. '
+        'Попробуй перезапустить приложение.',
+      );
+    }
+  }
+
+  Map<String, dynamic> _decodeObject(http.Response response) {
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+
+    if (decoded is! Map<String, dynamic>) {
+      throw const GigaChatException(
+        'GigaChat вернул данные в неожиданном формате.',
+      );
+    }
+
+    return decoded;
+  }
+
+  String _httpError(int statusCode, {bool gettingToken = false}) {
+    final String description;
+
+    switch (statusCode) {
+      case 400:
+        description = gettingToken
+            ? 'Сервис отклонил запрос авторизации. '
+                  'Проверь Authorization Key и тип доступа.'
+            : 'Сервис отклонил запрос. '
+                  'Возможно, история беседы слишком большая '
+                  'или параметры модели недоступны. '
+                  'Попробуй начать новую беседу.';
+        break;
+
+      case 401:
+        description = gettingToken
+            ? 'Не удалось авторизоваться. '
+                  'Проверь Authorization Key в ai_config.dart. '
+                  'Вставляй его без слова Basic.'
+            : 'Сервис не принял токен доступа.';
+        break;
+
+      case 402:
+        description =
+            'Проверь доступный баланс и пакет токенов '
+            'в кабинете GigaChat.';
+        break;
+
+      case 403:
+        description =
+            'Доступ запрещён. Проверь права '
+            'и статус проекта GigaChat.';
+        break;
+
+      case 404:
+        description = gettingToken
+            ? 'Не найден адрес получения токена. '
+                  'Нужно проверить настройки подключения.'
+            : 'Не найден адрес API или запрошенная модель. '
+                  'Нужно проверить список доступных моделей.';
+        break;
+
+      case 413:
+        description =
+            'Запрос слишком большой. Начни новую беседу '
+            'или сократи сообщение.';
+        break;
+
+      case 422:
+        description = 'Сервис не смог обработать параметры запроса.';
+        break;
+
+      case 429:
+        description =
+            'Превышен лимит запросов. Подожди немного '
+            'и попробуй ещё раз.';
+        break;
+
+      default:
+        description = statusCode >= 500
+            ? 'На стороне сервиса временная ошибка. Попробуй позже.'
+            : 'Сервис вернул ошибку. Нужно проверить подключение.';
+    }
+
+    return '$description (HTTP $statusCode)';
+  }
+
+  void dispose() {
+    if (_disposed) {
+      return;
+    }
+
+    _disposed = true;
+    _client?.close();
+    _client = null;
+    _accessToken = null;
+    _expiresAt = 0;
+  }
+}
+
+class GigaChatException implements Exception {
+  const GigaChatException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
