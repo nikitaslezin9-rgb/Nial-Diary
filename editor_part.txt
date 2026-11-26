@@ -1,0 +1,399 @@
+﻿class Editor extends StatefulWidget {
+  const Editor({super.key, this.entry, required this.question});
+
+  final Entry? entry;
+  final int question;
+
+  @override
+  State<Editor> createState() => _EditorState();
+}
+
+class _EditorState extends State<Editor> {
+  late final TextEditingController title;
+  late final TextEditingController text;
+  late bool favorite;
+  late int question;
+  late final List<String> _photos;
+  bool _photoBusy = false;
+  String? _voice;
+  String? _video;
+  bool _voiceLocked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    title = TextEditingController(text: widget.entry?.title ?? '');
+    text = TextEditingController(text: widget.entry?.text ?? '');
+    favorite = widget.entry?.favorite ?? false;
+    question = widget.question;
+    _photos = List<String>.from(widget.entry?.photos ?? const []);
+    _voice = widget.entry?.voice;
+    _video = widget.entry?.video;
+  }
+
+  @override
+  void dispose() {
+    title.dispose();
+    text.dispose();
+    super.dispose();
+  }
+
+  Future<void> _addPhotos() async {
+    if (_photoBusy || _voiceLocked || _photos.length >= 6) return;
+    setState(() => _photoBusy = true);
+    var failed = 0;
+    var skipped = 0;
+    final added = <String>[];
+    try {
+      final files = await FilePicker.pickFiles(
+        type: FileType.image,
+        dialogTitle: 'Выбрать фотографии',
+      );
+      for (final file in files) {
+        if (_photos.length + added.length >= 6) {
+          skipped++;
+          continue;
+        }
+        try {
+          final builder = BytesBuilder(copy: false);
+          await for (final chunk in file.readAsByteStream()) {
+            if (builder.length + chunk.length > 20 * 1024 * 1024) {
+              throw const FormatException('Image too large');
+            }
+            builder.add(chunk);
+          }
+          final buffer = await ImmutableBuffer.fromUint8List(
+            builder.takeBytes(),
+          );
+          try {
+            final descriptor = await ImageDescriptor.encoded(buffer);
+            try {
+              final width = descriptor.width;
+              final height = descriptor.height;
+              if (width <= 0 || height <= 0 || width * height > 60000000) {
+                throw const FormatException('Image dimensions too large');
+              }
+              final longest = width > height ? width : height;
+              final scale = longest > 1280 ? 1280 / longest : 1.0;
+              final codec = await descriptor.instantiateCodec(
+                targetWidth: (width * scale).round().clamp(1, 1280).toInt(),
+                targetHeight: (height * scale).round().clamp(1, 1280).toInt(),
+              );
+              try {
+                final frame = await codec.getNextFrame();
+                try {
+                  final bytes = await frame.image.toByteData(
+                    format: ImageByteFormat.png,
+                  );
+                  if (bytes == null || bytes.lengthInBytes > 4 * 1024 * 1024) {
+                    throw const FormatException('Processed image too large');
+                  }
+                  added.add(
+                    await NialMedia.store(
+                      bytes.buffer.asUint8List(
+                        bytes.offsetInBytes,
+                        bytes.lengthInBytes,
+                      ),
+                      'png',
+                    ),
+                  );
+                } finally {
+                  frame.image.dispose();
+                }
+              } finally {
+                codec.dispose();
+              }
+            } finally {
+              descriptor.dispose();
+            }
+          } finally {
+            buffer.dispose();
+          }
+        } catch (_) {
+          failed++;
+        }
+      }
+      if (!mounted) return;
+      setState(() => _photos.addAll(added));
+      if (failed > 0 || skipped > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Добавлено: ${added.length}. Не удалось обработать: $failed. Сверх лимита: $skipped.',
+            ),
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Не удалось открыть выбор фото. Попробуй снова.'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _photoBusy = false);
+    }
+  }
+
+  Future<void> _addVideo() async {
+    if (_photoBusy || _voiceLocked || _video != null) return;
+    setState(() => _photoBusy = true);
+    try {
+      final selected = await FilePicker.pickFile(
+        type: FileType.video,
+        dialogTitle: 'Выбрать видео до 25 МиБ',
+      );
+      if (selected == null) return;
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in selected.readAsByteStream()) {
+        if (builder.length + chunk.length > NialMedia.maxVideo) {
+          throw const FormatException(
+            'Видео больше 25 МиБ. Выбери более короткий файл.',
+          );
+        }
+        builder.add(chunk);
+      }
+      final ref = await NialMedia.store(builder.takeBytes(), 'mp4');
+      final controller = VideoPlayerController.file(NialMedia.file(ref));
+      try {
+        await controller.initialize().timeout(const Duration(seconds: 30));
+        if (controller.value.duration > const Duration(minutes: 5) ||
+            controller.value.duration <= Duration.zero) {
+          throw const FormatException(
+            'Нужно видео длительностью от 1 секунды до 5 минут.',
+          );
+        }
+      } finally {
+        await controller.dispose();
+      }
+      if (mounted) setState(() => _video = ref);
+    } on FormatException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Не удалось добавить видео. Попробуй обычный MP4, который воспроизводится на телефоне.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _photoBusy = false);
+    }
+  }
+
+  void save() {
+    if (_voiceLocked || _photoBusy) return;
+    if (title.text.trim().isEmpty &&
+        text.text.trim().isEmpty &&
+        _photos.isEmpty &&
+        _voice == null &&
+        _video == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Добавь текст или вложение')),
+      );
+      return;
+    }
+
+    Navigator.of(context).pop(
+      Entry(
+        title.text.trim(),
+        text.text.trim(),
+        widget.entry?.date ?? DateTime.now(),
+        favorite: favorite,
+        photos: _photos,
+        voice: _voice,
+        video: _video,
+        id: widget.entry?.id,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    if (_photoBusy) {
+      return const PopScope(
+        canPop: false,
+        child: Scaffold(
+          body: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Подготавливаем медиа…'),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return PopScope(
+      canPop: !_voiceLocked,
+      child: Scaffold(
+        appBar: AppBar(
+          backgroundColor: theme.scaffoldBackgroundColor,
+          surfaceTintColor: Colors.transparent,
+          title: Text(widget.entry == null ? 'Новая запись' : 'Твоя запись'),
+          actions: [
+            IconButton(
+              tooltip: 'Избранное',
+              onPressed: () => setState(() => favorite = !favorite),
+              icon: Icon(
+                favorite
+                    ? Icons.bookmark_rounded
+                    : Icons.bookmark_border_rounded,
+              ),
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 500),
+              child: ListView(
+                padding: const EdgeInsets.all(22),
+                children: [
+                  TextField(
+                    key: const ValueKey('entry_title_field'),
+                    controller: title,
+                    maxLines: null,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: const TextStyle(
+                      fontSize: 25,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    decoration: const InputDecoration(
+                      hintText: 'Дай мысли название…',
+                      border: InputBorder.none,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  if (text.text.trim().isEmpty)
+                    Container(
+                      padding: const EdgeInsets.all(17),
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.primary.withValues(alpha: .12),
+                        borderRadius: BorderRadius.circular(19),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            prompts[question],
+                            style: const TextStyle(height: 1.6),
+                          ),
+                          TextButton(
+                            onPressed: () => setState(
+                              () => question = (question + 1) % prompts.length,
+                            ),
+                            child: const Text('Другой вопрос ↻'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    key: const ValueKey('entry_body_field'),
+                    controller: text,
+                    onChanged: (_) => setState(() {}),
+                    minLines: 8,
+                    maxLines: null,
+                    textCapitalization: TextCapitalization.sentences,
+                    style: const TextStyle(fontSize: 16, height: 1.7),
+                    decoration: const InputDecoration(
+                      hintText: 'Здесь можно быть собой…',
+                      border: InputBorder.none,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  const Text(
+                    'Видео',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                  ),
+                  if (_video == null)
+                    OutlinedButton.icon(
+                      onPressed: _voiceLocked || _photoBusy ? null : _addVideo,
+                      icon: const Icon(Icons.video_library_outlined),
+                      label: const Text('Добавить видео'),
+                    )
+                  else ...[
+                    OutlinedButton.icon(
+                      onPressed: _voiceLocked
+                          ? null
+                          : () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) =>
+                                    _VideoScreen(reference: _video!),
+                              ),
+                            ),
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('Смотреть видео'),
+                    ),
+                    TextButton(
+                      onPressed: _voiceLocked
+                          ? null
+                          : () => setState(() => _video = null),
+                      child: const Text('Убрать видео из записи'),
+                    ),
+                  ],
+                  const Text(
+                    'Одно видео до 25 МиБ и 5 минут. Без сжатия; поддержка формата зависит от телефона.',
+                  ),
+                  const SizedBox(height: 16),
+                  _VoiceNoteEditor(
+                    value: _voice,
+                    onChanged: (value) => setState(() => _voice = value),
+                    onLocked: (locked) => setState(() => _voiceLocked = locked),
+                  ),
+                  const SizedBox(height: 16),
+                  _photoStrip(
+                    context,
+                    _photos,
+                    onRemove: (index) {
+                      setState(() => _photos.removeAt(index));
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: _photoBusy || _voiceLocked || _photos.length >= 6
+                        ? null
+                        : _addPhotos,
+                    icon: const Icon(Icons.add_photo_alternate_outlined),
+                    label: Text('Добавить фото (${_photos.length}/6)'),
+                  ),
+                  const Text(
+                    'До 6 фото. Копии уменьшаются до 1280 пикселей по длинной стороне. '
+                    'Исходные файлы в галерее не изменяются.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton(
+                    onPressed: _voiceLocked ? null : save,
+                    child: const Text('Сохранить запись'),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Записи сохраняются в локальной базе на устройстве. '
+                    'Фотографии входят в новые резервные копии. Голосовые заметки также входят в новые копии. Видео также входит в ZIP-копии.',
+                    style: TextStyle(fontSize: 12, height: 1.6),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
