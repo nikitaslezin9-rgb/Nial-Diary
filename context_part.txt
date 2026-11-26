@@ -1,0 +1,166 @@
+﻿=== строки 838-848 ===
+        item['title'] as String,
+        item['text'] as String,
+        parsedDate,
+        favorite: item['favorite'] as bool,
+        photos: _readEntryPhotos(item['photos']),
+        video: _readEntryVideo(item['video']),
+        voice: _readEntryVoice(item['voice']),
+        id: _readEntryId(item['id'], restoredIds),
+      );
+    }).toList();
+    return (restored, profile);
+=== строки 918-926 ===
+                'text': e.text,
+                'date': e.date.toIso8601String(),
+                'favorite': e.favorite,
+                'photos': e.photos,
+                'voice': e.voice,
+                'video': e.video,
+              },
+            )
+            .toList(),
+=== строки 1130-1150 ===
+  }
+
+  List<NialCloudEntry> _cloudEntries() => [
+    for (final entry in entries)
+      NialCloudEntry(
+        id: entry.id,
+        title: entry.title,
+        text: entry.text,
+        date: entry.date,
+        favorite: entry.favorite,
+        photoCount: entry.photos.length,
+        hasVoice: entry.voice != null,
+        hasVideo: entry.video != null,
+      ),
+  ];
+
+  void _scheduleCloudSync() {
+    if (!_storageReady) return;
+    _cloud.schedule(_cloudEntries);
+  }
+
+=== строки 1185-1262 ===
+        var idsAdded = false;
+
+        final restored = decoded.map<Entry>((item) {
+          final map = Map<String, dynamic>.from(item as Map);
+          final id = _readEntryId(map['id'], restoredIds);
+          if (id == null) idsAdded = true;
+
+          return Entry(
+            map['title'] as String,
+            map['text'] as String,
+            DateTime.parse(map['date'] as String),
+            favorite: map['favorite'] as bool? ?? false,
+            photos: _readEntryPhotos(map['photos']),
+            video: _readEntryVideo(map['video']),
+            voice: _readEntryVoice(map['voice']),
+            id: id,
+          );
+        }).toList();
+
+        if (saved != originalSaved) {
+          await _diaryStorage.writeWithRecovery(saved);
+          if (!mounted) return;
+        }
+        entries
+          ..clear()
+          ..addAll(restored);
+        if (idsAdded) {
+          // Старые записи получили постоянные идентификаторы: сохраняем их,
+          // чтобы они не менялись при следующем запуске.
+          await _diaryStorage.writeWithRecovery(_encodeDiary());
+          if (!mounted) return;
+        }
+      } else {
+        await _diaryStorage.write(_encodeDiary());
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _storageReady = true;
+        _storageError = null;
+      });
+
+      await _cloud.load();
+      _scheduleCloudSync();
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        _storageReady = false;
+        _storageError =
+            'Не удалось открыть сохранённый дневник. '
+            'Существующая база не перезаписана. '
+            'Попробуй повторить загрузку.';
+      });
+    }
+  }
+
+  String _encodeDiary() {
+    return jsonEncode(
+      entries
+          .map(
+            (entry) => {
+              'id': entry.id,
+              'title': entry.title,
+              'text': entry.text,
+              'date': entry.date.toIso8601String(),
+              'favorite': entry.favorite,
+              'photos': entry.photos,
+              'voice': entry.voice,
+              'video': entry.video,
+            },
+          )
+          .toList(),
+    );
+  }
+
+  Future<void> _saveDiary() async {
+=== строки 1636-1665 ===
+                    Text(
+                      e.title.isEmpty ? 'Без названия' : e.title,
+                      style: const TextStyle(
+                        fontSize: 19,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (e.video != null) ...[
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) => _VideoScreen(reference: e.video!),
+                          ),
+                        ),
+                        icon: const Icon(Icons.play_circle_outline),
+                        label: const Text('Смотреть видео'),
+                      ),
+                    ],
+                    if (e.voice != null) ...[
+                      const SizedBox(height: 10),
+                      const Text(
+                        'Голосовая заметка — открой запись для прослушивания',
+                      ),
+                    ],
+                    if (e.photos.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      _photoStrip(context, e.photos),
+                    ],
+                    if (e.text.isNotEmpty) ...[
+=== grep video в services ===
+nial_cloud.dart:21: this.hasVideo = false,
+nial_cloud.dart:31: final bool hasVideo;
+nial_cloud.dart:56: hasVideo,
+nial_cloud.dart:76: 'hasVideo': {'booleanValue': hasVideo},
+nial_cloud.dart:626: hasVideo: flag('hasVideo'),
+nial_media.dart:14: static const maxVideo = 25 * 1024 * 1024;
+nial_media.dart:38: final cap = extension == 'mp4' ? maxVideo : maxPhotoVoice;
+nial_media.dart:116: for (final key in ['voice', 'video']) {
+nial_media.dart:154: final cap = ref.endsWith('.mp4') ? maxVideo : maxPhotoVoice;
+nial_media.dart:209: ? maxVideo
+nial_media.dart:258: if (item['video'] != null) item['video'] = replacements[item['video']];
